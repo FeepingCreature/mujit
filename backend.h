@@ -71,7 +71,8 @@ typedef struct {
 
 typedef struct {
     void* (*new_function)(Type* args_ptr, size_t args_num);
-    void (*(*finalize_function)(void *fun))();
+    void (*finalize_function)(void *fun);
+    void (*(*to_funcptr)(void *fun))();
     Reg (*immediate_void)(void *fun, RegList discards);
     Reg (*immediate_int32)(void *fun, int32_t value, RegList discards);
     Reg (*immediate_int64)(void *fun, int64_t value, RegList discards);

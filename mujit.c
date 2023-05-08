@@ -21,9 +21,9 @@ int main() {
     Reg call_ret = backend->call(builder, fn_reg, type_void(), args, types, ND);
     backend->discard(builder, (RegList) { 1, &call_ret } );
     backend->ret(builder, backend->immediate_void(builder, ND), type_void());
+    backend->finalize_function(builder);
     backend->debug_dump(builder);
-
-    void (*funcptr)() = backend->finalize_function(builder);
+    void (*funcptr)() = backend->to_funcptr(builder);
     funcptr();
     return 0;
 }

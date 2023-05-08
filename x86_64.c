@@ -35,7 +35,7 @@
 
 void append_x86_64_imm_w(Buffer *buffer, uint32_t imm) {
     for (int i = 0; i < 4; i++) {
-        append(buffer, 0);
+        append(buffer, imm & 0xff);
         imm >>= 8;
     }
 }
@@ -49,6 +49,10 @@ void append_x86_64_imm_q(Buffer *buffer, uint64_t imm) {
 
 void append_x86_64_modrm(Buffer *buffer, int mod, int reg, int rm) {
     append(buffer, (mod << 6) + (reg << 3) + rm);
+}
+
+void append_x86_64_sib(Buffer *buffer, int scalemode, int index_reg, int base_reg) {
+    append(buffer, (scalemode << 6) + (index_reg << 3) + base_reg);
 }
 
 void append_x86_64_rex(Buffer *buffer, bool w, bool r, bool x, bool b) {
@@ -84,6 +88,14 @@ void append_x86_64_sub_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
     append_x86_64_op_r_reg_reg(buffer, 0x29, to_reg, from_reg);
 }
 
+void append_x86_64_sub_reg_imm(Buffer *buffer, int reg, int imm) {
+    append_x86_64_rex(buffer, 1, 0, 0, reg & 0x8);
+    append(buffer, 0x81);
+    // immediate, 81 /5
+    append_x86_64_modrm(buffer, 3, 5, reg & 0x7);
+    append_x86_64_imm_w(buffer, imm);
+}
+
 void append_x86_64_cmp_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
     append_x86_64_op_r_reg_reg(buffer, 0x3B, to_reg, from_reg);
 }
@@ -114,6 +126,35 @@ void append_x86_64_jmp_cond(Buffer *buffer, int cond) {
     // placeholder (this will hang forever by jumping to itself)
     append_x86_64_imm_w(buffer, -6);
 }
+
+// reg[offset] = source
+void append_x86_64_store_reg_offset(Buffer *buffer, int base_reg, int offset, int source_reg) {
+    assert(offset >= 0 && offset < 128);
+    append_x86_64_rex(buffer, 1, source_reg & 0x8, 0, base_reg & 0x8);
+    // mov reg/mem, reg
+    append(buffer, 0x89);
+    int basemode = 1; // 2 for 4-byte offset
+    append_x86_64_modrm(buffer, basemode, source_reg & 0x7, base_reg & 0x7);
+    if (base_reg == X86_64_RSP) {
+        append_x86_64_sib(buffer, 0, X86_64_RSP, X86_64_RSP);
+    }
+    append(buffer, (char) offset);
+}
+
+// dest = reg[offset]
+void append_x86_64_load_reg_offset(Buffer *buffer, int dest_reg, int base_reg, int offset) {
+    assert(offset >= 0 && offset < 128);
+    append_x86_64_rex(buffer, 1, dest_reg & 0x8, 0, base_reg & 0x8);
+    // mov reg, reg/mem
+    append(buffer, 0x8B);
+    int basemode = 1; // 2 for 4-byte offset
+    append_x86_64_modrm(buffer, basemode, dest_reg & 0x7, base_reg & 0x7);
+    if (base_reg == X86_64_RSP) {
+        append_x86_64_sib(buffer, 0, X86_64_RSP, X86_64_RSP);
+    }
+    append(buffer, (char) offset);
+}
+
 
 typedef struct {
     bool in_hw_reg;
@@ -153,6 +194,8 @@ typedef struct {
     Stackframe stackframe;
     HwRegMap hw_reg_map;
     int next_reg;
+    size_t frame_sub_offset;
+    int frame_high_water_mark;
 } X86_64_Function_Builder;
 
 int alloc_next_reg(X86_64_Function_Builder *builder) {
@@ -179,21 +222,27 @@ int alloc_free_stackspace_for_reg(X86_64_Function_Builder *builder, int size, in
     for (int i = 0; i < size; i++) {
         builder->stackframe.ptr[start + i] = reg;
     }
+    if (start + size > builder->frame_high_water_mark)
+        builder->frame_high_water_mark = start + size;
     return start;
 }
 
 void spill_to_stack(X86_64_Function_Builder *builder, int reg) {
     RegRow *row = &builder->registers.ptr[reg];
+    assert(row->type.kind == TYPE_INT64);
     int size = type_size(row->type);
     assert(row->in_hw_reg);
-    builder->hw_reg_map.gp_regs[row->hw_reg] = -1;
-    row->in_hw_reg = false;
+    int hwreg = row->hw_reg;
     // updates builder->stackframe
     row->stack_offset = alloc_free_stackspace_for_reg(builder, size, reg);
-    // TODO generate actual mov
-    assert(false);
+    row->in_hw_reg = false;
+    append_x86_64_store_reg_offset(&builder->buffer, X86_64_RSP, row->stack_offset, hwreg);
+    builder->hw_reg_map.gp_regs[hwreg] = -1;
 }
 
+/**
+ * Find or free up a hardware register to allocate to reg 'reg'.
+ */
 int alloc_hwreg(X86_64_Function_Builder *builder, int reg) {
     // hack: spill the reg with the smallest number
     // TODO spill the LRU reg
@@ -234,8 +283,7 @@ void move_reg_to_hw(X86_64_Function_Builder *builder, Reg reg, int hwreg) {
     } else {
         int current_offset = row->stack_offset, size = type_size(row->type);
         assert(row->type.kind == TYPE_INT64);
-        assert(false); // TODO
-        // append_x86_64_load_reg_offset(&builder->buffer, hwreg, current_offset);
+        append_x86_64_load_reg_offset(&builder->buffer, hwreg, X86_64_RSP, current_offset);
         for (int i = current_offset; i < current_offset + size; i++) {
             builder->stackframe.ptr[i] = -1;
         }
@@ -244,6 +292,20 @@ void move_reg_to_hw(X86_64_Function_Builder *builder, Reg reg, int hwreg) {
     assert(builder->hw_reg_map.gp_regs[hwreg] == -1);
     builder->hw_reg_map.gp_regs[hwreg] = reg.id;
     row->hw_reg = hwreg;
+}
+
+// don't update any builder stats, just copy into a known hwreg
+// this is used if we want to pull a copy of a reg to use in an instr,
+// but not use it going forward after.
+void copy_reg_to_hw(X86_64_Function_Builder *builder, Reg reg, int hwreg) {
+    RegRow *row = &builder->registers.ptr[reg.id];
+    if (row->in_hw_reg) {
+        append_x86_64_set_reg_reg(&builder->buffer, hwreg, row->hw_reg);
+    } else {
+        int current_offset = row->stack_offset; // , size = type_size(row->type);
+        assert(row->type.kind == TYPE_INT64);
+        append_x86_64_load_reg_offset(&builder->buffer, hwreg, X86_64_RSP, current_offset);
+    }
 }
 
 void* x86_64_new_function(Type* args_ptr, size_t args_num) {
@@ -255,6 +317,8 @@ void* x86_64_new_function(Type* args_ptr, size_t args_num) {
     // header
     append_x86_64_push_reg(&builder->buffer, X86_64_RBP);
     append_x86_64_set_reg_reg(&builder->buffer, X86_64_RBP, X86_64_RSP);
+    builder->frame_sub_offset = builder->buffer.offset;
+    append_x86_64_sub_reg_imm(&builder->buffer, X86_64_RSP, 0);
     return builder;
 }
 
@@ -286,6 +350,12 @@ Reg x86_64_immediate_void(void *fun, RegList discards) {
 Reg x86_64_call(void *fun, Reg target, Type ret_type, RegList args, TypeList types, RegList discards) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     // bleh bleh bleh bleh bleh bleh
+    // First spill all regs currently in hwregs to the stack.
+    // TODO unless it's in discards
+    for (int i = 0; i < 16; i++) {
+        int reg = builder->hw_reg_map.gp_regs[i];
+        if (reg != -1) spill_to_stack(builder, reg);
+    }
     int preferred_int_regs[6] = { X86_64_RDI, X86_64_RSI, X86_64_RDX, X86_64_RCX, X86_64_R8, X86_64_R9 };
     bool occupied[16] = { 0 };
     for (int i = 0; i < args.length; i++) {
@@ -294,7 +364,7 @@ Reg x86_64_call(void *fun, Reg target, Type ret_type, RegList args, TypeList typ
         int hwreg = preferred_int_regs[i];
         int blocking_reg = builder->hw_reg_map.gp_regs[hwreg];
         if (blocking_reg != -1) spill_to_stack(builder, blocking_reg);
-        move_reg_to_hw(builder, args.ptr[i], hwreg);
+        copy_reg_to_hw(builder, args.ptr[i], hwreg);
         occupied[hwreg] = true;
     }
     int target_hwreg;
@@ -305,7 +375,7 @@ Reg x86_64_call(void *fun, Reg target, Type ret_type, RegList args, TypeList typ
         for (int i = 0; i < 16; i++) {
             if (occupied[i]) continue;
             target_hwreg = i;
-            move_reg_to_hw(builder, target, i);
+            copy_reg_to_hw(builder, target, i);
             break;
         }
     }
@@ -318,6 +388,7 @@ void x86_64_ret(void *fun, Reg reg, Type type) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     assert(type.kind == TYPE_VOID);
     assert(builder->registers.ptr[reg.id].type.kind == TYPE_VOID);
+    append_x86_64_set_reg_reg(&builder->buffer, X86_64_RSP, X86_64_RBP);
     append_x86_64_pop_reg(&builder->buffer, X86_64_RBP);
     append_x86_64_ret(&builder->buffer);
 }
@@ -343,7 +414,14 @@ union pedantic_convert {
     void (*funcptr)();
 };
 
-void (*x86_64_finalize_function(void *fun))() {
+void x86_64_finalize_function(void *fun) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    Buffer patcher = builder->buffer;
+    patcher.offset = builder->frame_sub_offset;
+    append_x86_64_sub_reg_imm(&patcher, X86_64_RSP, builder->frame_high_water_mark);
+}
+
+void (*x86_64_to_funcptr(void *fun))() {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     int pages = (builder->buffer.offset + 1023) / 1024;
     unsigned char *target = mmap(NULL, pages * 1024, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -366,6 +444,7 @@ Backend *create_backend_x86_64() {
         .ret = x86_64_ret,
         .debug_dump = x86_64_debug_dump,
         .finalize_function = x86_64_finalize_function,
+        .to_funcptr = x86_64_to_funcptr,
     };
     return backend;
 }
