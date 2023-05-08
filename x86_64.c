@@ -199,7 +199,17 @@ int alloc_hwreg(X86_64_Function_Builder *builder, int reg) {
     // TODO spill the LRU reg
     int spill_candidate_reg = -1;
     int spill_candidate_hwreg = -1;
+    bool available[16] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    // callee-saved, so we just don't use them
+    available[X86_64_RSP] = false;
+    available[X86_64_RBP] = false;
+    available[X86_64_RBX] = false;
+    available[X86_64_R12] = false;
+    available[X86_64_R13] = false;
+    available[X86_64_R14] = false;
+    available[X86_64_R15] = false;
     for (int i = 0; i < 16; i++) {
+        if (!available[i]) continue;
         int current_reg = builder->hw_reg_map.gp_regs[i];
         if (current_reg == -1) {
             builder->hw_reg_map.gp_regs[i] = reg;
