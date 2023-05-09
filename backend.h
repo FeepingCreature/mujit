@@ -64,6 +64,9 @@ typedef struct {
     int id;
 } Reg;
 
+#define INVALID_REG ((Reg) { -1 })
+#define IS_VALID_REG(X) ((X).id != -1)
+
 typedef struct {
     size_t length;
     Reg *ptr;
@@ -87,6 +90,7 @@ typedef struct {
     Reg (*immediate_int32)(void *fun, int32_t value, RegList discards);
     Reg (*immediate_int64)(void *fun, int64_t value, RegList discards);
     Reg (*immediate_function)(void *fun, Marker marker, RegList discards);
+    Reg (*arg)(void *fun, int arg);
     Reg (*call)(void *fun, Reg target, Type ret_type, RegList args, TypeList types, RegList discards);
     void (*ret)(void *fun, Reg reg, Type type);
     void (*branch)(void *fun, Marker marker);

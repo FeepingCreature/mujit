@@ -18,35 +18,41 @@ int main() {
 
     Marker main_marker = backend->declare_function(module);
     Marker test_marker = backend->declare_function(module);
+    void *main_builder, *test_builder;
+
     {
         void *builder = backend->new_function(module, main_marker, NULL, 0);
+        main_builder = builder;
         Reg fn_reg = backend->immediate_function(builder, test_marker, ND);
         RegList args = { 0, NULL };
         TypeList types = { 0, NULL };
         Reg call_ret = backend->call(builder, fn_reg, type_void(), args, types, ND);
         backend->discard(builder, (RegList) { 1, &call_ret } );
-        backend->ret(builder, backend->immediate_void(builder, ND), type_void());
+        backend->ret(builder, backend->immediate_int64(builder, 5, ND), type_int64());
+        // backend->ret(builder, backend->immediate_void(builder, ND), type_void());
         backend->finalize_function(builder);
-        backend->debug_dump(builder);
     }
 
-    void *builder = backend->new_function(module, test_marker, NULL, 0);
-    Marker body_marker = backend->label_marker(builder);
-    backend->branch(builder, body_marker);
-    backend->label(builder, body_marker);
-    Reg param_reg = backend->immediate_int64(builder, (size_t) helloworld, ND);
-    Reg fn_reg = backend->immediate_function(builder, printf_marker, ND);
-    RegList args = { 1, &param_reg };
-    Type argtypes = type_int64();
-    TypeList types = { 1, &argtypes };
-    Reg call_ret = backend->call(builder, fn_reg, type_void(), args, types, ND);
-    backend->discard(builder, (RegList) { 1, &call_ret } );
-    backend->ret(builder, backend->immediate_void(builder, ND), type_void());
-    backend->finalize_function(builder);
+    {
+        void *builder = backend->new_function(module, test_marker, NULL, 0);
+        test_builder = builder;
+        Marker body_marker = backend->label_marker(builder);
+        backend->branch(builder, body_marker);
+        backend->label(builder, body_marker);
+        Reg param_reg = backend->immediate_int64(builder, (size_t) helloworld, ND);
+        Reg fn_reg = backend->immediate_function(builder, printf_marker, ND);
+        RegList args = { 1, &param_reg };
+        Type argtypes = type_int64();
+        TypeList types = { 1, &argtypes };
+        Reg call_ret = backend->call(builder, fn_reg, type_void(), args, types, ND);
+        backend->discard(builder, (RegList) { 1, &call_ret } );
+        backend->ret(builder, backend->immediate_void(builder, ND), type_void());
+        backend->finalize_function(builder);
+    }
 
     backend->link(module);
-    backend->debug_dump(builder);
-    void (*funcptr)() = backend->get_funcptr(builder);
-    funcptr();
-    return 0;
+    backend->debug_dump(test_builder);
+    backend->debug_dump(main_builder);
+    int (*funcptr)() = (int(*)()) backend->get_funcptr(main_builder);
+    return funcptr();
 }
