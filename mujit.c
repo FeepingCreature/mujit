@@ -31,6 +31,9 @@ int main() {
     }
 
     void *builder = backend->new_function(module, test_marker, NULL, 0);
+    Marker body_marker = backend->label_marker(builder);
+    backend->branch(builder, body_marker);
+    backend->label(builder, body_marker);
     Reg param_reg = backend->immediate_int64(builder, (size_t) helloworld, ND);
     Reg fn_reg = backend->immediate_function(builder, printf_marker, ND);
     RegList args = { 1, &param_reg };

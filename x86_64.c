@@ -141,6 +141,14 @@ void append_x86_64_jmp_cond(Buffer *buffer, int cond) {
     append_x86_64_imm_w(buffer, -6);
 }
 
+size_t append_x86_64_jmp_marker(Buffer *buffer) {
+    append(buffer, 0xE9);
+    size_t offset = buffer->offset;
+    // placeholder (this will hang forever by jumping to itself)
+    append_x86_64_imm_w(buffer, -5);
+    return offset;
+}
+
 // reg[offset] = source
 void append_x86_64_store_reg_offset(Buffer *buffer, int base_reg, int offset, int source_reg) {
     assert(offset >= 0 && offset < 128);
@@ -213,12 +221,22 @@ void alloc_reg(RegMap *map, int reg_id) {
 }
 
 typedef struct {
+    size_t length;
+    size_t *ptr;
+} Labels;
+
+typedef struct {
     Marker declaration;
     Buffer buffer;
     RegMap registers;
     Stackframe stackframe;
     HwRegMap hw_reg_map;
-    RelocTargets reloc_targets;
+    // label targets are resolved relatively, on finalize.
+    // function targets are resolved absolutely, on link.
+    RelocTargets function_targets;
+    RelocTargets label_targets;
+    // offset of each label in the buffer
+    Labels labels;
     int next_reg;
     size_t frame_sub_offset;
     int frame_high_water_mark;
@@ -403,8 +421,8 @@ void x86_64_link_module(void *module_) {
     target_offset = 0;
     for (int i = 0; i < module->builders.length; i++) {
         X86_64_Function_Builder *builder = module->builders.ptr[i];
-        for (int k = 0; k < builder->reloc_targets.length; k++) {
-            RelocTarget *target = &builder->reloc_targets.ptr[k];
+        for (int k = 0; k < builder->function_targets.length; k++) {
+            RelocTarget *target = &builder->function_targets.ptr[k];
             Buffer upfixer = builder->buffer;
             upfixer.offset = target->offset;
             append_x86_64_imm_q(&upfixer, marker_values[target->marker.id]);
@@ -416,6 +434,15 @@ void x86_64_link_module(void *module_) {
         target_offset += builder->buffer.offset;
     }
     mprotect(target, pages * 1024, PROT_EXEC);
+}
+
+Marker x86_64_label_marker(void *fun) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    Labels *labels = &builder->labels;
+    labels->ptr = realloc(labels->ptr, ++labels->length * sizeof(size_t));
+    // unset label
+    labels->ptr[labels->length - 1] = -1;
+    return (Marker) { labels->length - 1 };
 }
 
 void *x86_64_new_function(void *module_, Marker marker, Type* args_ptr, size_t args_num) {
@@ -454,7 +481,7 @@ Reg x86_64_immediate_function(void *fun, Marker marker, RegList discards) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     int reg = alloc_next_reg(builder);
     int hwreg = alloc_hwreg(builder, reg);
-    RelocTargets *targets = &builder->reloc_targets;
+    RelocTargets *targets = &builder->function_targets;
     targets->ptr = realloc(targets->ptr, ++targets->length * sizeof(RelocTarget));
     size_t offset = append_x86_64_set_reg_marker_placeholder(&builder->buffer, hwreg);
     targets->ptr[targets->length - 1] = (RelocTarget) { marker, offset };
@@ -524,6 +551,24 @@ void x86_64_ret(void *fun, Reg reg, Type type) {
     append_x86_64_ret(&builder->buffer);
 }
 
+void x86_64_branch(void *fun, Marker marker) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    assert(marker.id < builder->labels.length);
+    size_t offset = append_x86_64_jmp_marker(&builder->buffer);
+    RelocTargets *label_targets = &builder->label_targets;
+    label_targets->ptr = realloc(label_targets->ptr, ++label_targets->length);
+    label_targets->ptr[label_targets->length - 1] = (RelocTarget) {
+        .marker = marker,
+        .offset = offset,
+    };
+}
+
+void x86_64_label(void *fun, Marker marker) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    assert(marker.id < builder->labels.length);
+    builder->labels.ptr[marker.id] = builder->buffer.offset;
+}
+
 void x86_64_discard(void *fun, RegList discards) {
     // TODO
 }
@@ -542,9 +587,22 @@ void x86_64_debug_dump(void *fun) {
 
 void x86_64_finalize_function(void *fun) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
-    Buffer patcher = builder->buffer;
-    patcher.offset = builder->frame_sub_offset;
-    append_x86_64_sub_reg_imm(&patcher, X86_64_RSP, builder->frame_high_water_mark);
+    // patch stackframe allocation
+    {
+        Buffer patcher = builder->buffer;
+        patcher.offset = builder->frame_sub_offset;
+        append_x86_64_sub_reg_imm(&patcher, X86_64_RSP, builder->frame_high_water_mark);
+    }
+    // patch jump labels
+    for (int i = 0; i < builder->label_targets.length; i++) {
+        RelocTarget *target = &builder->label_targets.ptr[i];
+        size_t label = builder->labels.ptr[target->marker.id];
+        assert(label != -1);
+        Buffer patcher = builder->buffer;
+        patcher.offset = target->offset;
+        // reloffs starts after the instr
+        append_x86_64_imm_w(&patcher, label - (patcher.offset + 4));
+    }
 }
 
 void (*x86_64_get_funcptr(void *fun))() {
@@ -571,10 +629,13 @@ Backend *create_backend_x86_64() {
         .call = x86_64_call,
         .discard = x86_64_discard,
         .ret = x86_64_ret,
+        .branch = x86_64_branch,
+        .label = x86_64_label,
         .debug_dump = x86_64_debug_dump,
         .finalize_function = x86_64_finalize_function,
         .link = x86_64_link_module,
         .get_funcptr = x86_64_get_funcptr,
+        .label_marker = x86_64_label_marker,
     };
     return backend;
 }

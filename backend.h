@@ -81,12 +81,17 @@ typedef struct {
     void (*import_function)(void *module_, Marker marker, void (*funcptr)());
     void (*finalize_function)(void *fun);
     void (*link)(void *module_);
+    // Get a label marker that can later be resolved to a position in the function
+    Marker (*label_marker)(void *fun);
     Reg (*immediate_void)(void *fun, RegList discards);
     Reg (*immediate_int32)(void *fun, int32_t value, RegList discards);
     Reg (*immediate_int64)(void *fun, int64_t value, RegList discards);
     Reg (*immediate_function)(void *fun, Marker marker, RegList discards);
     Reg (*call)(void *fun, Reg target, Type ret_type, RegList args, TypeList types, RegList discards);
     void (*ret)(void *fun, Reg reg, Type type);
+    void (*branch)(void *fun, Marker marker);
+    // Assign the current position to the label marker.
+    void (*label)(void *fun, Marker marker);
     void (*discard)(void *fun, RegList discards);
     void (*debug_dump)(void *fun);
     void (*(*get_funcptr)(void *fun))();
