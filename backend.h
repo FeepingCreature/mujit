@@ -70,16 +70,26 @@ typedef struct {
 } RegList;
 
 typedef struct {
-    void* (*new_function)(Type* args_ptr, size_t args_num);
+    int32_t id;
+} Marker;
+
+typedef struct {
+    void* (*new_module)();
+    Marker (*declare_function)(void *module_);
+    void* (*new_function)(void *module_, Marker marker, Type* args_ptr, size_t args_num);
+    // assign a funcptr to a declaration
+    void (*import_function)(void *module_, Marker marker, void (*funcptr)());
     void (*finalize_function)(void *fun);
-    void (*(*to_funcptr)(void *fun))();
+    void (*link)(void *module_);
     Reg (*immediate_void)(void *fun, RegList discards);
     Reg (*immediate_int32)(void *fun, int32_t value, RegList discards);
     Reg (*immediate_int64)(void *fun, int64_t value, RegList discards);
+    Reg (*immediate_function)(void *fun, Marker marker, RegList discards);
     Reg (*call)(void *fun, Reg target, Type ret_type, RegList args, TypeList types, RegList discards);
     void (*ret)(void *fun, Reg reg, Type type);
     void (*discard)(void *fun, RegList discards);
-    void (*debug_dump)(void *function);
+    void (*debug_dump)(void *fun);
+    void (*(*get_funcptr)(void *fun))();
     // Reg (*lt_)(Reg left, Reg right)
 } Backend;
 

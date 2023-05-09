@@ -33,6 +33,12 @@
 #define X86_64_COND_LE 0x0E
 #define X86_64_COND_GT 0x0F
 
+// Helper to avoid gcc -pedantic error for casting from function to data pointer.
+union pedantic_convert {
+    void *ptr;
+    void (*funcptr)();
+};
+
 void append_x86_64_imm_w(Buffer *buffer, uint32_t imm) {
     for (int i = 0; i < 4; i++) {
         append(buffer, imm & 0xff);
@@ -78,6 +84,14 @@ void append_x86_64_set_reg_imm(Buffer *buffer, int reg, size_t value) {
     append_x86_64_rex(buffer, 1, 0, 0, reg & 0x8);
     append(buffer, 0xb8 + (reg & 0x7));
     append_x86_64_imm_q(buffer, value);
+}
+
+size_t append_x86_64_set_reg_marker_placeholder(Buffer *buffer, int reg) {
+    append_x86_64_rex(buffer, 1, 0, 0, reg & 0x8);
+    append(buffer, 0xb8 + (reg & 0x7));
+    size_t offset = buffer->offset;
+    append_x86_64_imm_q(buffer, 0);
+    return offset;
 }
 
 void append_x86_64_add_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
@@ -172,14 +186,24 @@ typedef struct {
 
 // offset to register, -1 is unallocated
 typedef struct {
-    int *ptr;
     size_t length;
+    int *ptr;
 } Stackframe;
 
 typedef struct {
     // X86_64_REG to register, -1 is unallocated
     int gp_regs[16];
 } HwRegMap;
+
+typedef struct {
+    Marker marker;
+    size_t offset;
+} RelocTarget;
+
+typedef struct {
+    size_t length;
+    RelocTarget *ptr;
+} RelocTargets;
 
 void alloc_reg(RegMap *map, int reg_id) {
     if (reg_id < map->length)
@@ -189,14 +213,39 @@ void alloc_reg(RegMap *map, int reg_id) {
 }
 
 typedef struct {
+    Marker declaration;
     Buffer buffer;
     RegMap registers;
     Stackframe stackframe;
     HwRegMap hw_reg_map;
+    RelocTargets reloc_targets;
     int next_reg;
     size_t frame_sub_offset;
     int frame_high_water_mark;
+    void (*funcptr)();
 } X86_64_Function_Builder;
+
+
+typedef struct {
+    size_t length;
+    X86_64_Function_Builder **ptr;
+} X86_64_Function_Builders;
+
+typedef struct {
+    Marker marker;
+    int64_t value;
+} X86_64_Fixed_Resolution;
+
+typedef struct {
+    size_t length;
+    X86_64_Fixed_Resolution *ptr;
+} X86_64_Fixed_Resolutions;
+
+typedef struct {
+    size_t next_marker;
+    X86_64_Function_Builders builders;
+    X86_64_Fixed_Resolutions resolutions;
+} X86_64_Module;
 
 int alloc_next_reg(X86_64_Function_Builder *builder) {
     int reg = builder->next_reg++;
@@ -308,17 +357,82 @@ void copy_reg_to_hw(X86_64_Function_Builder *builder, Reg reg, int hwreg) {
     }
 }
 
-void* x86_64_new_function(Type* args_ptr, size_t args_num) {
+void x86_64_import_function(void *module_, Marker marker, void (*funcptr)()) {
+    X86_64_Module *module = (X86_64_Module*) module_;
+    X86_64_Fixed_Resolutions *resolutions = &module->resolutions;
+    union pedantic_convert convert;
+    convert.funcptr = funcptr;
+    resolutions->ptr = realloc(resolutions->ptr, ++resolutions->length * sizeof(X86_64_Fixed_Resolution));
+    resolutions->ptr[resolutions->length - 1] = (X86_64_Fixed_Resolution) {
+        .marker = marker,
+        .value = (int64_t) convert.ptr,
+    };
+}
+
+void *x86_64_new_module() {
+    X86_64_Module *module = malloc(sizeof(X86_64_Module));
+    *module = (X86_64_Module) {0};
+    return module;
+}
+
+void x86_64_link_module(void *module_) {
+    X86_64_Module *module = (X86_64_Module*) module_;
+    // Allocate the target area.
+    uint64_t *marker_values = malloc(module->next_marker * sizeof(uint64_t));
+
+    for (int i = 0; i < module->resolutions.length; i++) {
+        X86_64_Fixed_Resolution *resolution = &module->resolutions.ptr[i];
+        marker_values[resolution->marker.id] = resolution->value;
+    }
+
+    size_t code_length = 0;
+    for (int i = 0; i < module->builders.length; i++) {
+        X86_64_Function_Builder *builder = module->builders.ptr[i];
+        code_length += builder->buffer.offset;
+    }
+    int pages = (code_length + 1023) / 1024;
+    unsigned char *target = mmap(NULL, pages * 1024, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+
+    // Now that we know the target area, we can compute and resolve the offsets.
+    size_t target_offset = 0;
+    for (int i = 0; i < module->builders.length; i++) {
+        X86_64_Function_Builder *builder = module->builders.ptr[i];
+        marker_values[builder->declaration.id] = (int64_t)(target + target_offset);
+        target_offset += builder->buffer.offset;
+    }
+    target_offset = 0;
+    for (int i = 0; i < module->builders.length; i++) {
+        X86_64_Function_Builder *builder = module->builders.ptr[i];
+        for (int k = 0; k < builder->reloc_targets.length; k++) {
+            RelocTarget *target = &builder->reloc_targets.ptr[k];
+            Buffer upfixer = builder->buffer;
+            upfixer.offset = target->offset;
+            append_x86_64_imm_q(&upfixer, marker_values[target->marker.id]);
+        }
+        memcpy(target + target_offset, builder->buffer.ptr, builder->buffer.offset);
+        union pedantic_convert generated_fn;
+        generated_fn.ptr = target + target_offset;
+        builder->funcptr = generated_fn.funcptr;
+        target_offset += builder->buffer.offset;
+    }
+    mprotect(target, pages * 1024, PROT_EXEC);
+}
+
+void *x86_64_new_function(void *module_, Marker marker, Type* args_ptr, size_t args_num) {
+    X86_64_Module *module = (X86_64_Module*) module_;
     X86_64_Function_Builder *builder = malloc(sizeof(X86_64_Function_Builder));
     *builder = (X86_64_Function_Builder) { 0 };
     for (int i = 0; i < 16; i++) {
         builder->hw_reg_map.gp_regs[i] = -1;
     }
+    builder->declaration = marker;
     // header
     append_x86_64_push_reg(&builder->buffer, X86_64_RBP);
     append_x86_64_set_reg_reg(&builder->buffer, X86_64_RBP, X86_64_RSP);
     builder->frame_sub_offset = builder->buffer.offset;
     append_x86_64_sub_reg_imm(&builder->buffer, X86_64_RSP, 0);
+    module->builders.ptr = realloc(module->builders.ptr, ++module->builders.length * sizeof(X86_64_Function_Builder*));
+    module->builders.ptr[module->builders.length - 1] = builder;
     return builder;
 }
 
@@ -327,6 +441,23 @@ Reg x86_64_immediate_int64(void *fun, int64_t value, RegList discards) {
     int reg = alloc_next_reg(builder);
     int hwreg = alloc_hwreg(builder, reg);
     append_x86_64_set_reg_imm(&builder->buffer, hwreg, (size_t) value);
+    builder->registers.ptr[reg] = (RegRow) {
+        .in_hw_reg = true,
+        .type = type_int64(),
+        .hw_reg = hwreg,
+    };
+    return (Reg) { reg };
+}
+
+
+Reg x86_64_immediate_function(void *fun, Marker marker, RegList discards) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    int reg = alloc_next_reg(builder);
+    int hwreg = alloc_hwreg(builder, reg);
+    RelocTargets *targets = &builder->reloc_targets;
+    targets->ptr = realloc(targets->ptr, ++targets->length * sizeof(RelocTarget));
+    size_t offset = append_x86_64_set_reg_marker_placeholder(&builder->buffer, hwreg);
+    targets->ptr[targets->length - 1] = (RelocTarget) { marker, offset };
     builder->registers.ptr[reg] = (RegRow) {
         .in_hw_reg = true,
         .type = type_int64(),
@@ -409,11 +540,6 @@ void x86_64_debug_dump(void *fun) {
     }
 }
 
-union pedantic_convert {
-    void *ptr;
-    void (*funcptr)();
-};
-
 void x86_64_finalize_function(void *fun) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     Buffer patcher = builder->buffer;
@@ -421,30 +547,34 @@ void x86_64_finalize_function(void *fun) {
     append_x86_64_sub_reg_imm(&patcher, X86_64_RSP, builder->frame_high_water_mark);
 }
 
-void (*x86_64_to_funcptr(void *fun))() {
+void (*x86_64_get_funcptr(void *fun))() {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
-    int pages = (builder->buffer.offset + 1023) / 1024;
-    unsigned char *target = mmap(NULL, pages * 1024, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    memcpy(target, builder->buffer.ptr, builder->buffer.offset);
-    mprotect(target, builder->buffer.offset, PROT_EXEC);
-    union pedantic_convert generated_fn;
-    generated_fn.ptr = target;
-    free(builder->buffer.ptr);
-    return generated_fn.funcptr;
+    assert(builder->funcptr);
+    return builder->funcptr;
+}
+
+Marker x86_64_declare_function(void *module_) {
+    X86_64_Module *module = (X86_64_Module*) module_;
+    return (Marker) {module->next_marker++};
 }
 
 Backend *create_backend_x86_64() {
     Backend *backend = malloc(sizeof(Backend));
     *backend = (Backend) {
+        .declare_function = x86_64_declare_function,
+        .new_module = x86_64_new_module,
         .new_function = x86_64_new_function,
+        .import_function = x86_64_import_function,
         .immediate_int64 = x86_64_immediate_int64,
+        .immediate_function = x86_64_immediate_function,
         .immediate_void = x86_64_immediate_void,
         .call = x86_64_call,
         .discard = x86_64_discard,
         .ret = x86_64_ret,
         .debug_dump = x86_64_debug_dump,
         .finalize_function = x86_64_finalize_function,
-        .to_funcptr = x86_64_to_funcptr,
+        .link = x86_64_link_module,
+        .get_funcptr = x86_64_get_funcptr,
     };
     return backend;
 }
