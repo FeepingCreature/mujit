@@ -605,7 +605,7 @@ Reg x86_64_call(void *fun, Reg target, Type ret_type, RegList args, TypeList typ
         copy_reg_to_hw(builder, hwreg, args.ptr[i]);
         occupied[hwreg] = true;
     }
-    int target_hwreg;
+    int target_hwreg = -1;
     if (builder->block->registers.ptr[target.id].in_hw_reg) {
         target_hwreg = builder->block->registers.ptr[target.id].hw_reg;
     } else {
@@ -616,6 +616,7 @@ Reg x86_64_call(void *fun, Reg target, Type ret_type, RegList args, TypeList typ
             copy_reg_to_hw(builder, i, target);
             break;
         }
+        assert(target_hwreg != -1);
     }
     append_x86_64_call_reg(&builder->buffer, target_hwreg);
     if (ret_type.kind == TYPE_VOID) return INVALID_REG;
