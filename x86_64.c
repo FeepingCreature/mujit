@@ -134,11 +134,13 @@ void append_x86_64_pop_reg(Buffer *buffer, int reg) {
 }
 
 // Note: This function requires fixups, so save the offset *before* appending it.
-void append_x86_64_jmp_cond(Buffer *buffer, int cond) {
+size_t append_x86_64_jmp_cond_marker(Buffer *buffer, int cond) {
     append(buffer, 0x0F);
     append(buffer, 0x80 + cond);
+    size_t offset = buffer->offset;
     // placeholder (this will hang forever by jumping to itself)
     append_x86_64_imm_w(buffer, -6);
+    return offset;
 }
 
 size_t append_x86_64_jmp_marker(Buffer *buffer) {
@@ -176,7 +178,6 @@ void append_x86_64_load_reg_offset(Buffer *buffer, int dest_reg, int base_reg, i
     }
     append(buffer, (char) offset);
 }
-
 
 typedef struct {
     bool in_hw_reg;
@@ -236,12 +237,16 @@ typedef struct {
 } Args;
 
 typedef struct {
-    Marker declaration;
-    Buffer buffer;
-    Args args;
     RegMap registers;
     Stackframe stackframe;
     HwRegMap hw_reg_map;
+} X86_64_Block_Stats;
+
+typedef struct {
+    Marker declaration;
+    Buffer buffer;
+    Args args;
+    X86_64_Block_Stats *block;
     // label targets are resolved relatively, on finalize.
     // function targets are resolved absolutely, on link.
     RelocTargets function_targets;
@@ -253,7 +258,6 @@ typedef struct {
     int frame_high_water_mark;
     void (*funcptr)();
 } X86_64_Function_Builder;
-
 
 typedef struct {
     size_t length;
@@ -276,25 +280,26 @@ typedef struct {
     X86_64_Fixed_Resolutions resolutions;
 } X86_64_Module;
 
-Reg alloc_next_reg(X86_64_Function_Builder *builder) {
+Reg alloc_next_reg(X86_64_Function_Builder *builder, Type type) {
     int reg = builder->next_reg++;
-    alloc_reg(&builder->registers, reg);
+    alloc_reg(&builder->block->registers, reg);
+    builder->block->registers.ptr[reg].type = type;
     return (Reg) { reg };
 }
 
 void set_reg_in_hwreg(X86_64_Function_Builder *builder, Reg reg, int hwreg) {
-    RegRow *row = &builder->registers.ptr[reg.id];
+    RegRow *row = &builder->block->registers.ptr[reg.id];
     assert(row->type.kind == TYPE_INT64);
-    assert(!IS_VALID_REG(builder->hw_reg_map.gp_regs[hwreg]));
-    builder->hw_reg_map.gp_regs[hwreg] = reg;
+    assert(!IS_VALID_REG(builder->block->hw_reg_map.gp_regs[hwreg]));
+    builder->block->hw_reg_map.gp_regs[hwreg] = reg;
     row->in_hw_reg = true;
     row->hw_reg = hwreg;
 }
 
 int alloc_free_stackspace_for_reg(X86_64_Function_Builder *builder, int size, Reg reg) {
     int start = 0;
-    for (int i = 0; i < builder->stackframe.length; i++) {
-        if (IS_VALID_REG(builder->stackframe.ptr[i])) {
+    for (int i = 0; i < builder->block->stackframe.length; i++) {
+        if (IS_VALID_REG(builder->block->stackframe.ptr[i])) {
             start = i + 1;
             continue;
         }
@@ -302,12 +307,12 @@ int alloc_free_stackspace_for_reg(X86_64_Function_Builder *builder, int size, Re
             break;
         }
     }
-    if (builder->stackframe.length < start + size) {
-        builder->stackframe.length = start + size;
-        builder->stackframe.ptr = realloc(builder->stackframe.ptr, (start + size) * sizeof(Reg));
+    if (builder->block->stackframe.length < start + size) {
+        builder->block->stackframe.length = start + size;
+        builder->block->stackframe.ptr = realloc(builder->block->stackframe.ptr, (start + size) * sizeof(Reg));
     }
     for (int i = 0; i < size; i++) {
-        builder->stackframe.ptr[start + i] = reg;
+        builder->block->stackframe.ptr[start + i] = reg;
     }
     if (start + size > builder->frame_high_water_mark)
         builder->frame_high_water_mark = start + size;
@@ -315,16 +320,16 @@ int alloc_free_stackspace_for_reg(X86_64_Function_Builder *builder, int size, Re
 }
 
 void spill_to_stack(X86_64_Function_Builder *builder, Reg reg) {
-    RegRow *row = &builder->registers.ptr[reg.id];
+    RegRow *row = &builder->block->registers.ptr[reg.id];
     assert(row->type.kind == TYPE_INT64);
     int size = type_size(row->type);
     assert(row->in_hw_reg);
     int hwreg = row->hw_reg;
-    // updates builder->stackframe
+    // updates builder->block->stackframe
     row->stack_offset = alloc_free_stackspace_for_reg(builder, size, reg);
     row->in_hw_reg = false;
     append_x86_64_store_reg_offset(&builder->buffer, X86_64_RSP, row->stack_offset, hwreg);
-    builder->hw_reg_map.gp_regs[hwreg] = INVALID_REG;
+    builder->block->hw_reg_map.gp_regs[hwreg] = INVALID_REG;
 }
 
 /**
@@ -346,9 +351,8 @@ int alloc_hwreg(X86_64_Function_Builder *builder, Reg reg) {
     available[X86_64_R15] = false;
     for (int i = 0; i < 16; i++) {
         if (!available[i]) continue;
-        Reg current_reg = builder->hw_reg_map.gp_regs[i];
+        Reg current_reg = builder->block->hw_reg_map.gp_regs[i];
         if (!IS_VALID_REG(current_reg)) {
-            builder->hw_reg_map.gp_regs[i] = reg;
             return i;
         }
         if (!IS_VALID_REG(spill_candidate_reg) || current_reg.id < spill_candidate_reg.id) {
@@ -357,33 +361,33 @@ int alloc_hwreg(X86_64_Function_Builder *builder, Reg reg) {
         }
     }
     spill_to_stack(builder, spill_candidate_reg);
-    builder->hw_reg_map.gp_regs[spill_candidate_hwreg] = reg;
+    builder->block->hw_reg_map.gp_regs[spill_candidate_hwreg] = INVALID_REG;
     return spill_candidate_hwreg;
 }
 
-void move_reg_to_hw(X86_64_Function_Builder *builder, Reg reg, int hwreg) {
-    RegRow *row = &builder->registers.ptr[reg.id];
+int move_reg_to_hw(X86_64_Function_Builder *builder, Reg reg) {
+    RegRow *row = &builder->block->registers.ptr[reg.id];
     // unset current location
     if (row->in_hw_reg) {
-        append_x86_64_set_reg_reg(&builder->buffer, hwreg, row->hw_reg);
-        builder->hw_reg_map.gp_regs[row->hw_reg] = INVALID_REG;
-    } else {
-        int current_offset = row->stack_offset, size = type_size(row->type);
-        assert(row->type.kind == TYPE_INT64);
-        append_x86_64_load_reg_offset(&builder->buffer, hwreg, X86_64_RSP, current_offset);
-        for (int i = current_offset; i < current_offset + size; i++) {
-            builder->stackframe.ptr[i] = INVALID_REG;
-        }
+        return row->hw_reg;
+    }
+    int hwreg = alloc_hwreg(builder, reg);
+    int current_offset = row->stack_offset, size = type_size(row->type);
+    assert(row->type.kind == TYPE_INT64);
+    append_x86_64_load_reg_offset(&builder->buffer, hwreg, X86_64_RSP, current_offset);
+    for (int i = current_offset; i < current_offset + size; i++) {
+        builder->block->stackframe.ptr[i] = INVALID_REG;
     }
     // update new location
     set_reg_in_hwreg(builder, reg, hwreg);
+    return hwreg;
 }
 
 // don't update any builder stats, just copy into a known hwreg
 // this is used if we want to pull a copy of a reg to use in an instr,
 // but not use it going forward after.
 void copy_reg_to_hw(X86_64_Function_Builder *builder, int hwreg, Reg reg) {
-    RegRow *row = &builder->registers.ptr[reg.id];
+    RegRow *row = &builder->block->registers.ptr[reg.id];
     if (row->in_hw_reg) {
         if (hwreg != row->hw_reg) {
             append_x86_64_set_reg_reg(&builder->buffer, hwreg, row->hw_reg);
@@ -456,6 +460,28 @@ void x86_64_link_module(void *module_) {
     mprotect(target, pages * 1024, PROT_EXEC);
 }
 
+void copy_block(X86_64_Block_Stats *dest, X86_64_Block_Stats *src) {
+    dest->registers.length = src->registers.length;
+    dest->registers.ptr = malloc(dest->registers.length * sizeof(RegRow));
+    memcpy(dest->registers.ptr, src->registers.ptr, dest->registers.length * sizeof(RegRow));
+    dest->stackframe.length = src->stackframe.length;
+    dest->stackframe.ptr = malloc(dest->stackframe.length * sizeof(Reg));
+    memcpy(dest->stackframe.ptr, src->stackframe.ptr, dest->stackframe.length * sizeof(Reg));
+    memcpy(&dest->hw_reg_map, &src->hw_reg_map, 16 * sizeof(Reg));
+}
+
+void* x86_64_begin_bb(void *fun, void *pred_bb) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    assert(builder->block == NULL);
+    builder->block = malloc(sizeof(X86_64_Block_Stats));
+    if (pred_bb) {
+        copy_block(builder->block, (X86_64_Block_Stats*) pred_bb);
+    } else {
+        *builder->block = (X86_64_Block_Stats) {0};
+    }
+    return builder->block;
+}
+
 Marker x86_64_label_marker(void *fun) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     Labels *labels = &builder->labels;
@@ -465,12 +491,13 @@ Marker x86_64_label_marker(void *fun) {
     return (Marker) { labels->length - 1 };
 }
 
-void *x86_64_new_function(void *module_, Marker marker, Type* args_ptr, size_t args_num) {
+void *x86_64_new_function(void *module_, Marker marker, Type* args_ptr, size_t args_num, void **entry_bb) {
     X86_64_Module *module = (X86_64_Module*) module_;
     X86_64_Function_Builder *builder = malloc(sizeof(X86_64_Function_Builder));
     *builder = (X86_64_Function_Builder) { 0 };
+    *entry_bb = x86_64_begin_bb(builder, NULL);
     for (int i = 0; i < 16; i++) {
-        builder->hw_reg_map.gp_regs[i] = INVALID_REG;
+        builder->block->hw_reg_map.gp_regs[i] = INVALID_REG;
     }
     builder->args = (Args) {
         .length = args_num,
@@ -481,7 +508,7 @@ void *x86_64_new_function(void *module_, Marker marker, Type* args_ptr, size_t a
     for (int i = 0; i < args_num; i++) {
         Type arg_type = args_ptr[i];
         assert(arg_type.kind == TYPE_INT64);
-        Reg reg = alloc_next_reg(builder);
+        Reg reg = alloc_next_reg(builder, arg_type);
         builder->args.ptr[i] = (Arg) {
             .type = arg_type,
             .reg = reg,
@@ -501,31 +528,45 @@ void *x86_64_new_function(void *module_, Marker marker, Type* args_ptr, size_t a
 
 Reg x86_64_immediate_int64(void *fun, int64_t value, RegList discards) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
-    Reg reg = alloc_next_reg(builder);
+    Reg reg = alloc_next_reg(builder, type_int64());
     int hwreg = alloc_hwreg(builder, reg);
     append_x86_64_set_reg_imm(&builder->buffer, hwreg, (size_t) value);
-    builder->registers.ptr[reg.id] = (RegRow) {
-        .in_hw_reg = true,
-        .type = type_int64(),
-        .hw_reg = hwreg,
-    };
+    set_reg_in_hwreg(builder, reg, hwreg);
     return reg;
 }
 
 
 Reg x86_64_immediate_function(void *fun, Marker marker, RegList discards) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
-    Reg reg = alloc_next_reg(builder);
+    Reg reg = alloc_next_reg(builder, type_int64());
     int hwreg = alloc_hwreg(builder, reg);
     RelocTargets *targets = &builder->function_targets;
     targets->ptr = realloc(targets->ptr, ++targets->length * sizeof(RelocTarget));
     size_t offset = append_x86_64_set_reg_marker_placeholder(&builder->buffer, hwreg);
     targets->ptr[targets->length - 1] = (RelocTarget) { marker, offset };
-    builder->registers.ptr[reg.id] = (RegRow) {
-        .in_hw_reg = true,
-        .type = type_int64(),
-        .hw_reg = hwreg,
-    };
+    set_reg_in_hwreg(builder, reg, hwreg);
+    return reg;
+}
+
+Reg x86_64_add(void *fun, Reg left, Reg right, RegList discards) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    Reg reg = alloc_next_reg(builder, type_int64());
+    int hwret = alloc_hwreg(builder, reg);
+    set_reg_in_hwreg(builder, reg, hwret);
+    copy_reg_to_hw(builder, hwret, left);
+    int hwright = move_reg_to_hw(builder, right);
+    append_x86_64_add_reg_reg(&builder->buffer, hwret, hwright);
+    return reg;
+}
+
+Reg x86_64_sub(void *fun, Reg left, Reg right, RegList discards) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    Reg reg = alloc_next_reg(builder, type_int64());
+    int hwret = alloc_hwreg(builder, reg);
+    set_reg_in_hwreg(builder, reg, hwret);
+    copy_reg_to_hw(builder, hwret, left);
+    int hwright = move_reg_to_hw(builder, right);
+    append_x86_64_sub_reg_reg(&builder->buffer, hwret, hwright);
     return reg;
 }
 
@@ -537,13 +578,10 @@ Reg x86_64_arg(void *fun, int arg) {
 
 Reg x86_64_immediate_void(void *fun, RegList discards) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
-    Reg reg = alloc_next_reg(builder);
+    Reg reg = alloc_next_reg(builder, type_void());
     // no space necessary
     // TODO always return the same register?
-    builder->registers.ptr[reg.id] = (RegRow) {
-        .in_hw_reg = false,
-        .type = type_void(),
-    };
+    builder->block->registers.ptr[reg.id].in_hw_reg = false;
     return reg;
 }
 
@@ -553,23 +591,23 @@ Reg x86_64_call(void *fun, Reg target, Type ret_type, RegList args, TypeList typ
     // First spill all regs currently in hwregs to the stack.
     // TODO unless it's in discards
     for (int i = 0; i < 16; i++) {
-        Reg reg = builder->hw_reg_map.gp_regs[i];
+        Reg reg = builder->block->hw_reg_map.gp_regs[i];
         if (IS_VALID_REG(reg)) spill_to_stack(builder, reg);
     }
     int preferred_int_regs[6] = { X86_64_RDI, X86_64_RSI, X86_64_RDX, X86_64_RCX, X86_64_R8, X86_64_R9 };
     bool occupied[16] = { 0 };
     for (int i = 0; i < args.length; i++) {
-        RegRow row = builder->registers.ptr[args.ptr[i].id];
+        RegRow row = builder->block->registers.ptr[args.ptr[i].id];
         assert(row.type.kind == TYPE_INT64);
         int hwreg = preferred_int_regs[i];
-        Reg blocking_reg = builder->hw_reg_map.gp_regs[hwreg];
+        Reg blocking_reg = builder->block->hw_reg_map.gp_regs[hwreg];
         if (IS_VALID_REG(blocking_reg)) spill_to_stack(builder, blocking_reg);
         copy_reg_to_hw(builder, hwreg, args.ptr[i]);
         occupied[hwreg] = true;
     }
     int target_hwreg;
-    if (builder->registers.ptr[target.id].in_hw_reg) {
-        target_hwreg = builder->registers.ptr[target.id].hw_reg;
+    if (builder->block->registers.ptr[target.id].in_hw_reg) {
+        target_hwreg = builder->block->registers.ptr[target.id].hw_reg;
     } else {
         // find a free hwreg for the funcptr
         for (int i = 0; i < 16; i++) {
@@ -580,16 +618,22 @@ Reg x86_64_call(void *fun, Reg target, Type ret_type, RegList args, TypeList typ
         }
     }
     append_x86_64_call_reg(&builder->buffer, target_hwreg);
-    assert(ret_type.kind == TYPE_VOID);
-    return INVALID_REG;
+    if (ret_type.kind == TYPE_VOID) return INVALID_REG;
+    else if (ret_type.kind == TYPE_INT64) {
+        Reg reg = alloc_next_reg(builder, ret_type);
+        set_reg_in_hwreg(builder, reg, X86_64_RAX);
+        return reg;
+    } else {
+        assert(false);
+    }
 }
 
 void x86_64_ret(void *fun, Reg reg, Type type) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     if (type.kind == TYPE_VOID) {
-        assert(builder->registers.ptr[reg.id].type.kind == TYPE_VOID);
+        assert(builder->block->registers.ptr[reg.id].type.kind == TYPE_VOID);
     } else if (type.kind == TYPE_INT64) {
-        assert(builder->registers.ptr[reg.id].type.kind == TYPE_INT64);
+        assert(builder->block->registers.ptr[reg.id].type.kind == TYPE_INT64);
         copy_reg_to_hw(builder, X86_64_RAX, reg);
     } else {
         assert(false);
@@ -597,18 +641,35 @@ void x86_64_ret(void *fun, Reg reg, Type type) {
     append_x86_64_set_reg_reg(&builder->buffer, X86_64_RSP, X86_64_RBP);
     append_x86_64_pop_reg(&builder->buffer, X86_64_RBP);
     append_x86_64_ret(&builder->buffer);
+    builder->block = NULL;
 }
 
-void x86_64_branch(void *fun, Marker marker) {
-    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
-    assert(marker.id < builder->labels.length);
-    size_t offset = append_x86_64_jmp_marker(&builder->buffer);
+void append_reloc_target(X86_64_Function_Builder *builder, Marker marker, size_t offset) {
     RelocTargets *label_targets = &builder->label_targets;
     label_targets->ptr = realloc(label_targets->ptr, ++label_targets->length);
     label_targets->ptr[label_targets->length - 1] = (RelocTarget) {
         .marker = marker,
         .offset = offset,
     };
+}
+
+void x86_64_branch(void *fun, Marker marker) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    assert(marker.id < builder->labels.length);
+    size_t offset = append_x86_64_jmp_marker(&builder->buffer);
+    append_reloc_target(builder, marker, offset);
+    builder->block = NULL;
+}
+
+void x86_64_branch_if_equal(void *fun, Marker marker, Reg first, Reg second) {
+    X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    assert(marker.id < builder->labels.length);
+    int hwreg1 = move_reg_to_hw(builder, first);
+    int hwreg2 = move_reg_to_hw(builder, second);
+    append_x86_64_cmp_reg_reg(&builder->buffer, hwreg2, hwreg1);
+    size_t offset = append_x86_64_jmp_cond_marker(&builder->buffer, X86_64_COND_EQ);
+    append_reloc_target(builder, marker, offset);
+    builder->block = NULL;
 }
 
 void x86_64_label(void *fun, Marker marker) {
@@ -635,6 +696,7 @@ void x86_64_debug_dump(void *fun) {
 
 void x86_64_finalize_function(void *fun) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
+    assert(builder->block == NULL);
     // patch stackframe allocation
     {
         // round-up to 16 to maintain x86-64 stack alignment
@@ -676,11 +738,15 @@ Backend *create_backend_x86_64() {
         .immediate_void = x86_64_immediate_void,
         .immediate_int64 = x86_64_immediate_int64,
         .immediate_function = x86_64_immediate_function,
+        .add = x86_64_add,
+        .sub = x86_64_sub,
         .arg = x86_64_arg,
-        .call = x86_64_call,
         .discard = x86_64_discard,
+        .call = x86_64_call,
+        .begin_bb = x86_64_begin_bb,
         .ret = x86_64_ret,
         .branch = x86_64_branch,
+        .branch_if_equal = x86_64_branch_if_equal,
         .label = x86_64_label,
         .debug_dump = x86_64_debug_dump,
         .finalize_function = x86_64_finalize_function,

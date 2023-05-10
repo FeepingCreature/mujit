@@ -79,7 +79,7 @@ typedef struct {
 typedef struct {
     void* (*new_module)();
     Marker (*declare_function)(void *module_);
-    void* (*new_function)(void *module_, Marker marker, Type* args_ptr, size_t args_num);
+    void* (*new_function)(void *module_, Marker marker, Type* args_ptr, size_t args_num, void **entry_bb);
     // assign a funcptr to a declaration
     void (*import_function)(void *module_, Marker marker, void (*funcptr)());
     void (*finalize_function)(void *fun);
@@ -90,10 +90,15 @@ typedef struct {
     Reg (*immediate_int32)(void *fun, int32_t value, RegList discards);
     Reg (*immediate_int64)(void *fun, int64_t value, RegList discards);
     Reg (*immediate_function)(void *fun, Marker marker, RegList discards);
+    Reg (*add)(void *fun, Reg left, Reg right, RegList discards);
+    Reg (*sub)(void *fun, Reg left, Reg right, RegList discards);
     Reg (*arg)(void *fun, int arg);
     Reg (*call)(void *fun, Reg target, Type ret_type, RegList args, TypeList types, RegList discards);
+    void* (*begin_bb)(void *fun, void *pred_bb);
+    // These functions must be succeeded by another begin_bb call.
     void (*ret)(void *fun, Reg reg, Type type);
     void (*branch)(void *fun, Marker marker);
+    void (*branch_if_equal)(void *fun, Marker marker, Reg first, Reg second);
     // Assign the current position to the label marker.
     void (*label)(void *fun, Marker marker);
     void (*discard)(void *fun, RegList discards);
