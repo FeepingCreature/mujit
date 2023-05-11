@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -128,6 +129,14 @@ void append_x86_64_call_reg(Buffer *buffer, int reg) {
     }
     append(buffer, 0xff);
     append_x86_64_modrm(buffer, 3, 2, reg & 0x7);
+}
+
+size_t append_x86_64_call_rel(Buffer *buffer) {
+    append(buffer, 0xe8);
+    size_t offset = buffer->offset;
+    // placeholder (this will crash by calling itself)
+    append_x86_64_imm_w(buffer, -5);
+    return offset;
 }
 
 void append_x86_64_ret(Buffer *buffer) {
@@ -265,8 +274,9 @@ typedef struct {
     Args args;
     X86_64_Block_Stats *block;
     // label targets are resolved relatively, on finalize.
-    // function targets are resolved absolutely, on link.
-    RelocTargets function_targets;
+    // function targets are resolved on link; near relatively, far absolutely.
+    RelocTargets near_function_targets;
+    RelocTargets far_function_targets;
     RelocTargets label_targets;
     // offset of each label in the buffer
     Labels labels;
@@ -409,7 +419,7 @@ int move_reg_to_hw(X86_64_Function_Builder *builder, Reg reg) {
 }
 
 void copy_reloc_to_hw(X86_64_Function_Builder *builder, int hwreg, Marker marker) {
-    RelocTargets *targets = &builder->function_targets;
+    RelocTargets *targets = &builder->far_function_targets;
     targets->ptr = realloc(targets->ptr, ++targets->length * sizeof(RelocTarget));
     size_t offset = append_x86_64_set_reg_marker_placeholder(&builder->buffer, hwreg);
     targets->ptr[targets->length - 1] = (RelocTarget) { marker, offset };
@@ -481,11 +491,19 @@ void x86_64_link_module(void *module_) {
     target_offset = 0;
     for (int i = 0; i < module->builders.length; i++) {
         X86_64_Function_Builder *builder = module->builders.ptr[i];
-        for (int k = 0; k < builder->function_targets.length; k++) {
-            RelocTarget *target = &builder->function_targets.ptr[k];
+        for (int k = 0; k < builder->near_function_targets.length; k++) {
+            RelocTarget *reloc = &builder->near_function_targets.ptr[k];
             Buffer upfixer = builder->buffer;
-            upfixer.offset = target->offset;
-            append_x86_64_imm_q(&upfixer, marker_values[target->marker.id]);
+            upfixer.offset = reloc->offset;
+            int64_t relvalue = marker_values[reloc->marker.id] - (int64_t) (target + target_offset + reloc->offset) - 4;
+            assert(relvalue >= INT_MIN && relvalue <= INT_MAX);
+            append_x86_64_imm_w(&upfixer, relvalue);
+        }
+        for (int k = 0; k < builder->far_function_targets.length; k++) {
+            RelocTarget *reloc = &builder->far_function_targets.ptr[k];
+            Buffer upfixer = builder->buffer;
+            upfixer.offset = reloc->offset;
+            append_x86_64_imm_q(&upfixer, marker_values[reloc->marker.id]);
         }
         memcpy(target + target_offset, builder->buffer.ptr, builder->buffer.offset);
         union pedantic_convert generated_fn;
@@ -655,27 +673,30 @@ Reg x86_64_call(void *fun, Reg target, RegList args, Type ret_type, Types types,
         copy_reg_to_hw(builder, hwreg, args.ptr[i]);
         occupied[hwreg] = true;
     }
-    int target_hwreg = -1;
     RegRow *target_row = &builder->block->registers.ptr[target.id];
     if (target_row->location == LOC_CPU) {
-        target_hwreg = builder->block->registers.ptr[target.id].hw_reg;
-    } else if (target_row->location == LOC_STACK || target_row->location == LOC_RELOC) {
+        int target_hwreg = builder->block->registers.ptr[target.id].hw_reg;
+        append_x86_64_call_reg(&builder->buffer, target_hwreg);
+    } else if (target_row->location == LOC_RELOC) {
+        size_t offset = append_x86_64_call_rel(&builder->buffer);
+        RelocTargets *targets = &builder->near_function_targets;
+        targets->ptr = realloc(targets->ptr, ++targets->length * sizeof(RelocTarget));
+        targets->ptr[targets->length - 1] = (RelocTarget) {
+            .marker = target_row->marker,
+            .offset = offset,
+        };
+    } else if (target_row->location == LOC_STACK || target_row->location == LOC_LITERAL) {
         // find a free hwreg for the funcptr
         for (int i = 0; i < 16; i++) {
             if (occupied[i]) continue;
-            target_hwreg = i;
-            if (target_row->location == LOC_STACK) {
-                copy_reg_to_hw(builder, i, target);
-            } else {
-                copy_reloc_to_hw(builder, i, target_row->marker);
-            }
+            int target_hwreg = i;
+            copy_reg_to_hw(builder, i, target);
+            append_x86_64_call_reg(&builder->buffer, target_hwreg);
             break;
         }
-        assert(target_hwreg != -1);
     } else {
         assert(false);
     }
-    append_x86_64_call_reg(&builder->buffer, target_hwreg);
     if (ret_type.size == 0) return INVALID_REG;
     else if (ret_type.size == 8) {
         Reg reg = alloc_next_reg(builder, ret_type);
@@ -705,7 +726,7 @@ void x86_64_ret(void *fun, Reg reg, Type type, CallingConvention *cc) {
     builder->block = NULL;
 }
 
-void append_reloc_target(X86_64_Function_Builder *builder, Marker marker, size_t offset) {
+void append_reloc_label_target(X86_64_Function_Builder *builder, Marker marker, size_t offset) {
     RelocTargets *label_targets = &builder->label_targets;
     label_targets->ptr = realloc(label_targets->ptr, ++label_targets->length);
     label_targets->ptr[label_targets->length - 1] = (RelocTarget) {
@@ -718,7 +739,7 @@ void x86_64_branch(void *fun, Marker marker) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     assert(marker.id < builder->labels.length);
     size_t offset = append_x86_64_jmp_marker(&builder->buffer);
-    append_reloc_target(builder, marker, offset);
+    append_reloc_label_target(builder, marker, offset);
     builder->block = NULL;
 }
 
@@ -729,7 +750,7 @@ void x86_64_branch_if_equal(void *fun, Marker marker, Reg first, Reg second) {
     int hwreg2 = move_reg_to_hw(builder, second);
     append_x86_64_cmp_reg_reg(&builder->buffer, hwreg2, hwreg1);
     size_t offset = append_x86_64_jmp_cond_marker(&builder->buffer, X86_64_COND_EQ);
-    append_reloc_target(builder, marker, offset);
+    append_reloc_label_target(builder, marker, offset);
     builder->block = NULL;
 }
 
@@ -795,7 +816,6 @@ Backend *create_backend_x86_64() {
         .declare_function = x86_64_declare_function,
         .new_module = x86_64_new_module,
         .new_function = x86_64_new_function,
-        .import_function = x86_64_import_function,
         .immediate_void = x86_64_immediate_void,
         .immediate_int64 = x86_64_immediate_int64,
         .immediate_function = x86_64_immediate_function,

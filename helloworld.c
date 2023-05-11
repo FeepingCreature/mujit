@@ -13,9 +13,6 @@ int main() {
     Backend *backend = create_backend_x86_64();
     void *module = backend->new_module();
 
-    Marker printf_marker = backend->declare_function(module);
-    backend->import_function(module, printf_marker, (void(*)()) printf);
-
     Marker main_marker = backend->declare_function(module);
     void *main_builder;
 
@@ -25,7 +22,7 @@ int main() {
         void *blk0;
         void *builder = backend->new_function(module, main_marker, main_types, &main_cc.base, &blk0);
         main_builder = builder;
-        Reg printf_reg = backend->immediate_function(builder, printf_marker, ND);
+        Reg printf_reg = backend->immediate_int64(builder, (int64_t) printf, ND);
         Reg helloworld_arg = backend->immediate_int64(builder, (int64_t) helloworld, ND);
         Reg printf_args_list[1] = {helloworld_arg};
         RegList printf_args = { 1, printf_args_list };

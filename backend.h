@@ -72,15 +72,15 @@ typedef struct {
     void* (*new_module)();
     Marker (*declare_function)(void *module_);
     void* (*new_function)(void *module_, Marker marker, Types args, CallingConvention *cc, void **entry_bb);
-    // assign a funcptr to a declaration
-    void (*import_function)(void *module_, Marker marker, void (*funcptr)());
     void (*finalize_function)(void *fun);
     void (*link)(void *module_);
     // Get a label marker that can later be resolved to a position in the function
     Marker (*label_marker)(void *fun);
     Reg (*immediate_void)(void *fun, RegList discards);
     Reg (*immediate_int32)(void *fun, int32_t value, RegList discards);
+    // Use this for far calls (native code calls) as well!
     Reg (*immediate_int64)(void *fun, int64_t value, RegList discards);
+    // Use for calling functions in the same module.
     Reg (*immediate_function)(void *fun, Marker marker, RegList discards);
     Reg (*add)(void *fun, Reg left, Reg right, RegList discards);
     Reg (*sub)(void *fun, Reg left, Reg right, RegList discards);
