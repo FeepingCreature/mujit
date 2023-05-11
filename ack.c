@@ -20,10 +20,12 @@ int ack_jit(int m, int n) {
     void *ack_builder;
 
     {
-        Type param_types[2] = {type_int64(), type_int64()};
-        TypeList ack_types = {2, param_types};
+        Type ack_type_list[2] = {type(8), type(8)};
+        Types ack_types = {2, ack_type_list};
+        X86_64_ArgumentClass ack_classes[2] = { X86_64_CLASS_INTEGER, X86_64_CLASS_INTEGER };
+        X86_64_SysV ack_cc = { { CALLING_CONVENTION_X86_64_SYSV }, { 2, ack_classes }, X86_64_CLASS_INTEGER };
         void *blk0;
-        void *builder = backend->new_function(module, ack_marker, param_types, 2, &blk0);
+        void *builder = backend->new_function(module, ack_marker, ack_types, &ack_cc.base, &blk0);
         ack_builder = builder;
         Reg m = backend->arg(builder, 0);
         Reg n = backend->arg(builder, 1);
@@ -43,23 +45,23 @@ int ack_jit(int m, int n) {
         Reg n_1 = backend->sub(builder, n, one, ND);
         Reg ack_inner_args_list[2] = {m, n_1};
         RegList ack_inner_args = {2, ack_inner_args_list};
-        Reg ack_inner = backend->call(builder, ack_fun, type_int64(), ack_inner_args, ack_types, ND);
+        Reg ack_inner = backend->call(builder, ack_fun, ack_inner_args, type(8), ack_types, &ack_cc.base, ND);
         Reg ack_outer_args_list[2] = {m_1, ack_inner};
         RegList ack_outer_args = {2, ack_outer_args_list};
-        Reg ack_outer = backend->call(builder, ack_fun, type_int64(), ack_outer_args, ack_types, ND);
-        backend->ret(builder, ack_outer, type_int64());
+        Reg ack_outer = backend->call(builder, ack_fun, ack_outer_args, type(8), ack_types, &ack_cc.base, ND);
+        backend->ret(builder, ack_outer, type(8), &ack_cc.base);
         // m_zero_marker: return n + 1
         backend->begin_bb(builder, blk0);
         backend->label(builder, m_zero_marker);
         Reg n1 = backend->add(builder, n, one, ND);
-        backend->ret(builder, n1, type_int64());
+        backend->ret(builder, n1, type(8), &ack_cc.base);
         // n_zero_marker: return ack(m - 1, 1);
         backend->begin_bb(builder, blk1);
         backend->label(builder, n_zero_marker);
         Reg ack_args_list[2] = {m_1, one};
         RegList ack_args = {2, ack_args_list};
-        Reg ack_ret = backend->call(builder, ack_fun, type_int64(), ack_args, ack_types, ND);
-        backend->ret(builder, ack_ret, type_int64());
+        Reg ack_ret = backend->call(builder, ack_fun, ack_args, type(8), ack_types, &ack_cc.base, ND);
+        backend->ret(builder, ack_ret, type(8), &ack_cc.base);
 
         backend->finalize_function(builder);
     }

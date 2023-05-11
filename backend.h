@@ -16,49 +16,41 @@ static inline void append(Buffer *buffer, unsigned char value) {
     buffer->offset += 1;
 }
 
-typedef enum {
-    TYPE_VOID,
-    TYPE_INT32,
-    TYPE_INT64,
-    TYPE_DATA,
-} TypeKind;
-
-typedef unsigned char Type_None;
-
 typedef struct {
     int size;
-} Type_Data;
-
-typedef struct {
-    TypeKind kind;
-    union {
-        Type_None none;
-        Type_Data data;
-    };
+    // int alignment;
 } Type;
+
+static inline Type type(int size) {
+    return (Type) { size };
+}
 
 typedef struct {
     size_t length;
     Type *ptr;
-} TypeList;
+} Types;
 
-static inline Type type_int64() {
-    return (Type) { TYPE_INT64, {(Type_None) 0} };
-}
+typedef enum {
+    CALLING_CONVENTION_X86_64_SYSV
+} CallingConventionType;
 
-static inline Type type_void() {
-    return (Type) { TYPE_VOID, {(Type_None) 0} };
-}
+typedef struct {
+    CallingConventionType type;
+} CallingConvention;
 
-static inline int type_size(Type type) {
-    switch (type.kind) {
-        case TYPE_VOID: return 0;
-        case TYPE_INT32: return 4;
-        case TYPE_INT64: return 8;
-        case TYPE_DATA: return type.data.size;
-        default: assert(false);
-    }
-}
+typedef enum {
+    X86_64_CLASS_INTEGER,
+    X86_64_CLASS_MEMORY,
+} X86_64_ArgumentClass;
+
+typedef struct {
+    CallingConvention base;
+    struct {
+        size_t length;
+        X86_64_ArgumentClass *ptr;
+    } arguments;
+    X86_64_ArgumentClass ret_class;
+} X86_64_SysV;
 
 typedef struct {
     int id;
@@ -79,7 +71,7 @@ typedef struct {
 typedef struct {
     void* (*new_module)();
     Marker (*declare_function)(void *module_);
-    void* (*new_function)(void *module_, Marker marker, Type* args_ptr, size_t args_num, void **entry_bb);
+    void* (*new_function)(void *module_, Marker marker, Types args, CallingConvention *cc, void **entry_bb);
     // assign a funcptr to a declaration
     void (*import_function)(void *module_, Marker marker, void (*funcptr)());
     void (*finalize_function)(void *fun);
@@ -93,10 +85,10 @@ typedef struct {
     Reg (*add)(void *fun, Reg left, Reg right, RegList discards);
     Reg (*sub)(void *fun, Reg left, Reg right, RegList discards);
     Reg (*arg)(void *fun, int arg);
-    Reg (*call)(void *fun, Reg target, Type ret_type, RegList args, TypeList types, RegList discards);
+    Reg (*call)(void *fun, Reg target, RegList args, Type ret, Types arg_types, CallingConvention *cc, RegList discards);
     void* (*begin_bb)(void *fun, void *pred_bb);
     // These functions must be succeeded by another begin_bb call.
-    void (*ret)(void *fun, Reg reg, Type type);
+    void (*ret)(void *fun, Reg reg, Type type, CallingConvention *cc);
     void (*branch)(void *fun, Marker marker);
     void (*branch_if_equal)(void *fun, Marker marker, Reg first, Reg second);
     // Assign the current position to the label marker.
