@@ -77,6 +77,14 @@ void append_x86_64_op_r_reg_reg(Buffer *buffer, unsigned char instrbyte, int to_
     append_x86_64_modrm(buffer, 3, from_reg & 0x7, to_reg & 0x7);
 }
 
+// 81 /7 id, for instance.
+void append_x86_64_op_r_reg_imm32(Buffer *buffer, unsigned char instrbyte, int modifier, int reg, int32_t imm) {
+    append_x86_64_rex(buffer, 1, 0, 0, reg & 0x8);
+    append(buffer, instrbyte);
+    append_x86_64_modrm(buffer, 3, modifier, reg & 0x7);
+    append_x86_64_imm_w(buffer, imm);
+}
+
 void append_x86_64_set_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
     append_x86_64_op_r_reg_reg(buffer, 0x89, to_reg, from_reg);
 }
@@ -100,11 +108,7 @@ void append_x86_64_add_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
 }
 
 void append_x86_64_add_reg_imm(Buffer *buffer, int reg, int32_t imm) {
-    append_x86_64_rex(buffer, 1, 0, 0, reg & 0x8);
-    append(buffer, 0x81);
-    // immediate, 81 /0
-    append_x86_64_modrm(buffer, 3, 0, reg & 0x7);
-    append_x86_64_imm_w(buffer, imm);
+    append_x86_64_op_r_reg_imm32(buffer, 0x81, 0, reg, imm);
 }
 
 void append_x86_64_sub_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
@@ -112,15 +116,15 @@ void append_x86_64_sub_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
 }
 
 void append_x86_64_sub_reg_imm(Buffer *buffer, int reg, int32_t imm) {
-    append_x86_64_rex(buffer, 1, 0, 0, reg & 0x8);
-    append(buffer, 0x81);
-    // immediate, 81 /5
-    append_x86_64_modrm(buffer, 3, 5, reg & 0x7);
-    append_x86_64_imm_w(buffer, imm);
+    append_x86_64_op_r_reg_imm32(buffer, 0x81, 5, reg, imm);
 }
 
 void append_x86_64_cmp_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
     append_x86_64_op_r_reg_reg(buffer, 0x3B, to_reg, from_reg);
+}
+
+void append_x86_64_cmp_reg_imm(Buffer *buffer, int reg, int32_t imm) {
+    append_x86_64_op_r_reg_imm32(buffer, 0x81, 7, reg, imm);
 }
 
 void append_x86_64_call_reg(Buffer *buffer, int reg) {
@@ -747,8 +751,13 @@ void x86_64_branch_if_equal(void *fun, Marker marker, Reg first, Reg second) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     assert(marker.id < builder->labels.length);
     int hwreg1 = move_reg_to_hw(builder, first);
-    int hwreg2 = move_reg_to_hw(builder, second);
-    append_x86_64_cmp_reg_reg(&builder->buffer, hwreg2, hwreg1);
+    RegRow *second_row = &builder->block->registers.ptr[second.id];
+    if (second_row->location == LOC_LITERAL && second_row->value >= INT32_MIN && second_row->value <= INT32_MAX) {
+        append_x86_64_cmp_reg_imm(&builder->buffer, hwreg1, second_row->value);
+    } else {
+        int hwreg2 = move_reg_to_hw(builder, second);
+        append_x86_64_cmp_reg_reg(&builder->buffer, hwreg1, hwreg2);
+    }
     size_t offset = append_x86_64_jmp_cond_marker(&builder->buffer, X86_64_COND_EQ);
     append_reloc_label_target(builder, marker, offset);
     builder->block = NULL;
