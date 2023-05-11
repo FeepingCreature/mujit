@@ -98,11 +98,19 @@ void append_x86_64_add_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
     append_x86_64_op_r_reg_reg(buffer, 0x01, to_reg, from_reg);
 }
 
+void append_x86_64_add_reg_imm(Buffer *buffer, int reg, int32_t imm) {
+    append_x86_64_rex(buffer, 1, 0, 0, reg & 0x8);
+    append(buffer, 0x81);
+    // immediate, 81 /0
+    append_x86_64_modrm(buffer, 3, 0, reg & 0x7);
+    append_x86_64_imm_w(buffer, imm);
+}
+
 void append_x86_64_sub_reg_reg(Buffer *buffer, int to_reg, int from_reg) {
     append_x86_64_op_r_reg_reg(buffer, 0x29, to_reg, from_reg);
 }
 
-void append_x86_64_sub_reg_imm(Buffer *buffer, int reg, int imm) {
+void append_x86_64_sub_reg_imm(Buffer *buffer, int reg, int32_t imm) {
     append_x86_64_rex(buffer, 1, 0, 0, reg & 0x8);
     append(buffer, 0x81);
     // immediate, 81 /5
@@ -179,12 +187,21 @@ void append_x86_64_load_reg_offset(Buffer *buffer, int dest_reg, int base_reg, i
     append(buffer, (char) offset);
 }
 
+typedef enum {
+    LOC_STACK,
+    LOC_CPU,
+    LOC_LITERAL,
+    LOC_RELOC,
+} RegLocation;
+
 typedef struct {
-    bool in_hw_reg;
+    RegLocation location;
     Type type;
     union {
         int stack_offset;
         int hw_reg;
+        int64_t value;
+        Marker marker;
     };
 } RegRow;
 
@@ -292,7 +309,7 @@ void set_reg_in_hwreg(X86_64_Function_Builder *builder, Reg reg, int hwreg) {
     assert(row->type.size == 8);
     assert(!IS_VALID_REG(builder->block->hw_reg_map.gp_regs[hwreg]));
     builder->block->hw_reg_map.gp_regs[hwreg] = reg;
-    row->in_hw_reg = true;
+    row->location = LOC_CPU;
     row->hw_reg = hwreg;
 }
 
@@ -323,11 +340,11 @@ int alloc_free_stackspace_for_reg(X86_64_Function_Builder *builder, Type type, R
 void spill_to_stack(X86_64_Function_Builder *builder, Reg reg) {
     RegRow *row = &builder->block->registers.ptr[reg.id];
     assert(row->type.size == 8);
-    assert(row->in_hw_reg);
+    assert(row->location == LOC_CPU);
     int hwreg = row->hw_reg;
     // updates builder->block->stackframe
     row->stack_offset = alloc_free_stackspace_for_reg(builder, row->type, reg);
-    row->in_hw_reg = false;
+    row->location = LOC_STACK;
     append_x86_64_store_reg_offset(&builder->buffer, X86_64_RSP, row->stack_offset, hwreg);
     builder->block->hw_reg_map.gp_regs[hwreg] = INVALID_REG;
 }
@@ -368,19 +385,34 @@ int alloc_hwreg(X86_64_Function_Builder *builder, Reg reg) {
 int move_reg_to_hw(X86_64_Function_Builder *builder, Reg reg) {
     RegRow *row = &builder->block->registers.ptr[reg.id];
     // unset current location
-    if (row->in_hw_reg) {
+    if (row->location == LOC_CPU) {
         return row->hw_reg;
     }
     int hwreg = alloc_hwreg(builder, reg);
-    int current_offset = row->stack_offset, size = row->type.size;
+    int size = row->type.size;
     assert(size == 8);
-    append_x86_64_load_reg_offset(&builder->buffer, hwreg, X86_64_RSP, current_offset);
-    for (int i = current_offset; i < current_offset + size; i++) {
-        builder->block->stackframe.ptr[i] = INVALID_REG;
+    if (row->location == LOC_STACK) {
+        int current_offset = row->stack_offset;
+        append_x86_64_load_reg_offset(&builder->buffer, hwreg, X86_64_RSP, current_offset);
+        for (int i = current_offset; i < current_offset + size; i++) {
+            builder->block->stackframe.ptr[i] = INVALID_REG;
+        }
+        // update new location
+        set_reg_in_hwreg(builder, reg, hwreg);
+    } else if (row->location == LOC_LITERAL) {
+        append_x86_64_set_reg_imm(&builder->buffer, hwreg, row->value);
+        // keep reg as literal!
+    } else {
+        assert(false);
     }
-    // update new location
-    set_reg_in_hwreg(builder, reg, hwreg);
     return hwreg;
+}
+
+void copy_reloc_to_hw(X86_64_Function_Builder *builder, int hwreg, Marker marker) {
+    RelocTargets *targets = &builder->function_targets;
+    targets->ptr = realloc(targets->ptr, ++targets->length * sizeof(RelocTarget));
+    size_t offset = append_x86_64_set_reg_marker_placeholder(&builder->buffer, hwreg);
+    targets->ptr[targets->length - 1] = (RelocTarget) { marker, offset };
 }
 
 // don't update any builder stats, just copy into a known hwreg
@@ -388,14 +420,18 @@ int move_reg_to_hw(X86_64_Function_Builder *builder, Reg reg) {
 // but not use it going forward after.
 void copy_reg_to_hw(X86_64_Function_Builder *builder, int hwreg, Reg reg) {
     RegRow *row = &builder->block->registers.ptr[reg.id];
-    if (row->in_hw_reg) {
+    if (row->location == LOC_CPU) {
         if (hwreg != row->hw_reg) {
             append_x86_64_set_reg_reg(&builder->buffer, hwreg, row->hw_reg);
         }
-    } else {
-        int current_offset = row->stack_offset; // , size = type_size(row->type);
+    } else if (row->location == LOC_STACK) {
+        int current_offset = row->stack_offset;
         assert(row->type.size == 8);
         append_x86_64_load_reg_offset(&builder->buffer, hwreg, X86_64_RSP, current_offset);
+    } else if (row->location == LOC_LITERAL) {
+        append_x86_64_set_reg_imm(&builder->buffer, hwreg, row->value);
+    } else {
+        assert(false);
     }
 }
 
@@ -533,22 +569,18 @@ void *x86_64_new_function(void *module_, Marker marker, Types args, CallingConve
 Reg x86_64_immediate_int64(void *fun, int64_t value, RegList discards) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     Reg reg = alloc_next_reg(builder, type(8));
-    int hwreg = alloc_hwreg(builder, reg);
-    append_x86_64_set_reg_imm(&builder->buffer, hwreg, (size_t) value);
-    set_reg_in_hwreg(builder, reg, hwreg);
+    RegRow *row = &builder->block->registers.ptr[reg.id];
+    row->location = LOC_LITERAL;
+    row->value = value;
     return reg;
 }
-
 
 Reg x86_64_immediate_function(void *fun, Marker marker, RegList discards) {
     X86_64_Function_Builder *builder = (X86_64_Function_Builder*) fun;
     Reg reg = alloc_next_reg(builder, type(8));
-    int hwreg = alloc_hwreg(builder, reg);
-    RelocTargets *targets = &builder->function_targets;
-    targets->ptr = realloc(targets->ptr, ++targets->length * sizeof(RelocTarget));
-    size_t offset = append_x86_64_set_reg_marker_placeholder(&builder->buffer, hwreg);
-    targets->ptr[targets->length - 1] = (RelocTarget) { marker, offset };
-    set_reg_in_hwreg(builder, reg, hwreg);
+    RegRow *row = &builder->block->registers.ptr[reg.id];
+    row->location = LOC_RELOC;
+    row->marker = marker;
     return reg;
 }
 
@@ -558,8 +590,13 @@ Reg x86_64_add(void *fun, Reg left, Reg right, RegList discards) {
     int hwret = alloc_hwreg(builder, reg);
     set_reg_in_hwreg(builder, reg, hwret);
     copy_reg_to_hw(builder, hwret, left);
-    int hwright = move_reg_to_hw(builder, right);
-    append_x86_64_add_reg_reg(&builder->buffer, hwret, hwright);
+    RegRow *right_row = &builder->block->registers.ptr[right.id];
+    if (right_row->location == LOC_LITERAL && right_row->value >= INT32_MIN && right_row->value <= INT32_MAX) {
+        append_x86_64_add_reg_imm(&builder->buffer, hwret, right_row->value);
+    } else {
+        int hwright = move_reg_to_hw(builder, right);
+        append_x86_64_add_reg_reg(&builder->buffer, hwret, hwright);
+    }
     return reg;
 }
 
@@ -569,8 +606,13 @@ Reg x86_64_sub(void *fun, Reg left, Reg right, RegList discards) {
     int hwret = alloc_hwreg(builder, reg);
     set_reg_in_hwreg(builder, reg, hwret);
     copy_reg_to_hw(builder, hwret, left);
-    int hwright = move_reg_to_hw(builder, right);
-    append_x86_64_sub_reg_reg(&builder->buffer, hwret, hwright);
+    RegRow *right_row = &builder->block->registers.ptr[right.id];
+    if (right_row->location == LOC_LITERAL && right_row->value >= INT32_MIN && right_row->value <= INT32_MAX) {
+        append_x86_64_sub_reg_imm(&builder->buffer, hwret, right_row->value);
+    } else {
+        int hwright = move_reg_to_hw(builder, right);
+        append_x86_64_sub_reg_reg(&builder->buffer, hwret, hwright);
+    }
     return reg;
 }
 
@@ -585,7 +627,7 @@ Reg x86_64_immediate_void(void *fun, RegList discards) {
     Reg reg = alloc_next_reg(builder, type(0));
     // no space necessary
     // TODO always return the same register?
-    builder->block->registers.ptr[reg.id].in_hw_reg = false;
+    builder->block->registers.ptr[reg.id].location = LOC_STACK;
     return reg;
 }
 
@@ -614,17 +656,24 @@ Reg x86_64_call(void *fun, Reg target, RegList args, Type ret_type, Types types,
         occupied[hwreg] = true;
     }
     int target_hwreg = -1;
-    if (builder->block->registers.ptr[target.id].in_hw_reg) {
+    RegRow *target_row = &builder->block->registers.ptr[target.id];
+    if (target_row->location == LOC_CPU) {
         target_hwreg = builder->block->registers.ptr[target.id].hw_reg;
-    } else {
+    } else if (target_row->location == LOC_STACK || target_row->location == LOC_RELOC) {
         // find a free hwreg for the funcptr
         for (int i = 0; i < 16; i++) {
             if (occupied[i]) continue;
             target_hwreg = i;
-            copy_reg_to_hw(builder, i, target);
+            if (target_row->location == LOC_STACK) {
+                copy_reg_to_hw(builder, i, target);
+            } else {
+                copy_reloc_to_hw(builder, i, target_row->marker);
+            }
             break;
         }
         assert(target_hwreg != -1);
+    } else {
+        assert(false);
     }
     append_x86_64_call_reg(&builder->buffer, target_hwreg);
     if (ret_type.size == 0) return INVALID_REG;
